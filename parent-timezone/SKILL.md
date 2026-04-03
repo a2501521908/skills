@@ -2,8 +2,8 @@
 name: parent-timezone
 description: >-
   修改国际化家长时区。通过管台接口更新 parent 的 timeZone 字段。
-  支持通过手机号搜索家长获取 parentId。需要浏览器登录管台获取认证 token。
-  支持 sa、k2、us、jp、tw、vn 六个站点。Token 自动缓存，修改后自动验证。
+  支持通过手机号搜索家长获取 parentId。通过 API 直接登录认证获取 token。
+  支持 sa、k2、us、jp、tw、vn 六个站点。Token 自动缓存，密码自动保存，修改后自动验证。
   Use when the user mentions 修改时区、家长时区、timeZone、parent timezone、时区修改工单。
 ---
 
@@ -11,10 +11,11 @@ description: >-
 
 ## 核心原则
 
-**通过管台 API 修改家长时区。Token 自动缓存复用，修改后自动验证结果。**
+**通过管台 API 修改家长时区。API 直接认证，密码用户全自动续期，Token 缓存复用，修改后自动验证。**
 
 - 脚本：`timezone.mjs`（位于本 SKILL.md 同目录下）
 - Token 缓存：`.tokens.json`（同目录，自动管理，8 小时过期）
+- 密码缓存：`.credentials.json`（同目录，密码用户自动保存，token 过期自动重新登录）
 - 无外部依赖，Node.js 18+ 即可运行
 
 ## 路径约定
@@ -45,8 +46,25 @@ description: >-
 向用户询问（可用 AskQuestion 工具）：
 
 1. **所属业务站点**：sa / k2 / us / jp / tw / vn
-2. **家长标识**：parentId（优先），或手机号（用于搜索）
+2. **家长标识**：用户会给一串数字，需要判断是手机号还是 parentId
 3. **目标时区**：用户可能说国家/城市名，需转换为 `GMT±HH:00` 格式
+
+### 手机号 vs parentId 判断策略
+
+用户给的数字，按以下规则判断：
+
+| 特征 | 判定 | 说明 |
+|------|------|------|
+| 7~15 位数字（含前导零） | **手机号** | 国际手机号通常 7~15 位 |
+| `0000` 或 `00000` 开头 | **测试手机号** | 系统测试账号约定 |
+| 1~6 位纯数字（无前导零） | **parentId** | parentId 通常较短 |
+| 用户明确说"手机号" | **手机号** | 以用户明确说法为准 |
+| 用户明确说"parentId/pid/用户ID" | **parentId** | 以用户明确说法为准 |
+
+**如果无法确定，必须向用户确认！** 例如："这个数字是手机号还是 parentId？"
+
+- 如果是**手机号**：先走第三步搜索，从结果中获取 parentId
+- 如果是**parentId**：直接走第四步修改
 
 ### 常见时区映射
 
@@ -66,46 +84,47 @@ description: >-
 | 新加坡 | GMT+08:00 |
 | 澳洲东部、悉尼 | GMT+10:00 |
 
-### 第二步：获取认证 Token
+### 第二步：认证（API 直接登录）
 
-**脚本自动管理 Token 缓存，按站点存储，8 小时有效。**
+**认证通过 API 直接登录，无需打开浏览器！**
 
-先检查是否有缓存 token：
+#### 首次认证
 
-```bash
-node $SKILL_DIR/timezone.mjs token-status
-```
-
-- **有有效缓存** → 直接跳到第三步，不传 `--token` 参数即可自动使用缓存
-- **无缓存或已过期** → 需要浏览器认证，流程如下：
-
-#### 浏览器认证流程
-
-1. 用 `browser_navigate` 打开对应站点管台首页：`https://{site}-manager.lionabc.com/`
-2. 站点会自动重定向到 SSO 登录页，等待用户完成登录
-3. 登录完成后，执行 cookie 提取：
-
-```
-browser_navigate → javascript:void(document.title=document.cookie)
-```
-
-4. 从返回的 Page Title 中用正则 `/intlAuthToken=([^;]+)/` 提取 token
-5. 保存 token 到缓存：
+1. 向用户询问**公司邮箱**（如 `xxx@vipkid.com.cn`）
+2. 查询登录策略：
 
 ```bash
-node $SKILL_DIR/timezone.mjs save-token --site {site} --token {token}
+node $SKILL_DIR/timezone.mjs login-strategy --site {site} --user {email}
 ```
 
-**后续操作自动使用缓存 token，无需再传 `--token`。**
+3. 根据策略类型：
+   - **PASSWORD** → 向用户询问密码，执行登录：
+   ```bash
+   node $SKILL_DIR/timezone.mjs auth --site {site} --user {email} --password {password}
+   ```
+   密码将自动保存到 `.credentials.json`，**后续 token 过期时全自动重新登录，无需再次输入**。
 
-#### 当 Token 失效时
+   - **PASSWORD_OTP** → 先发送验证码，再向用户询问收到的验证码：
+   ```bash
+   # 发送验证码（钉钉/邮箱）
+   node $SKILL_DIR/timezone.mjs send-otp --site {site} --email {email}
+   # 用户提供验证码后登录
+   node $SKILL_DIR/timezone.mjs auth --site {site} --user {email} --password {otp_code} --login-type PASSWORD_OTP
+   ```
 
-脚本调用 API 遇到认证失败会自动清除缓存并以 exit code 2 退出，输出 `AUTH_EXPIRED`。
-此时需重新走浏览器认证流程。
+**所有 Shell 调用必须添加 `required_permissions: ["full_network"]`**
 
-### 第三步：搜索家长（可选）
+#### Token 自动续期
 
-如果用户只提供了手机号：
+- 所有业务命令（search/update/verify）自动使用缓存 token，无需传 `--token`
+- Token 过期时：
+  - PASSWORD 用户：**全自动重新登录**，无需任何用户交互
+  - PASSWORD_OTP 用户：需要重新走 OTP 流程
+- 传入 `--token` 可手动覆盖并刷新缓存
+
+### 第三步：搜索家长（手机号时必须）
+
+如果是手机号，**必须先搜索获取 parentId，严禁直接拿手机号当 parentId 去修改！**
 
 ```bash
 node $SKILL_DIR/timezone.mjs search \
@@ -114,7 +133,24 @@ node $SKILL_DIR/timezone.mjs search \
 
 **必须添加 `required_permissions: ["full_network"]`**
 
-不传 `--country-code` 时使用站点默认国家码。如果搜出多个结果，展示给用户确认。
+不传 `--country-code` 时使用站点默认国家码。
+
+#### 搜索结果处理策略
+
+| 结果数量 | Agent 行为 |
+|----------|-----------|
+| **0 条** | 告知用户未找到，确认手机号和站点是否正确 |
+| **1 条** | 直接使用该 parentId 进入第四步 |
+| **≥2 条** | **必须用 AskQuestion 让用户选择！** 列出所有结果的 parentId、name、phone、email、status，让用户明确指定哪一个 |
+
+**多条结果示例**（使用 AskQuestion）：
+
+搜到多个家长，请选择：
+- A: parentId=12501913, name=test, phone=966-000****001, status=TEST
+- B: parentId=12501920, name=张三, phone=966-000****001, status=ACTIVE
+- C: parentId=12502000, name=李四, phone=86-000****001, status=ACTIVE
+
+**绝对不要自动选第一个！必须让用户确认。**
 
 ### 第四步：执行修改（自动验证）
 
@@ -142,11 +178,18 @@ node $SKILL_DIR/timezone.mjs verify \
 ## 快速示例
 
 ```bash
-# 检查 token 缓存状态
+# 查看 token & 凭据状态
 node $SKILL_DIR/timezone.mjs token-status
 
-# 保存 token（浏览器提取后）
-node $SKILL_DIR/timezone.mjs save-token --site sa --token 7822ac52-xxx
+# 查询登录策略
+node $SKILL_DIR/timezone.mjs login-strategy --site sa --user xxx@vipkid.com.cn
+
+# API 登录（密码模式 - 自动保存）
+node $SKILL_DIR/timezone.mjs auth --site sa --user xxx@vipkid.com.cn --password mypassword
+
+# API 登录（OTP 模式）
+node $SKILL_DIR/timezone.mjs send-otp --site sa --email xxx@vipkid.com.cn
+node $SKILL_DIR/timezone.mjs auth --site sa --user xxx@vipkid.com.cn --password 123456 --login-type PASSWORD_OTP
 
 # 搜索家长（自动使用缓存 token）
 node $SKILL_DIR/timezone.mjs search --site sa --phone 509471425
@@ -160,8 +203,9 @@ node $SKILL_DIR/timezone.mjs verify --site sa --parent-id 12501913
 
 ## 注意事项
 
-- Token 8 小时自动过期，过期后需重新浏览器认证
-- 传入 `--token` 会自动刷新缓存，不传则用缓存
-- exit code 2 表示认证问题，需重新浏览器认证
+- Token 8 小时自动过期
+- PASSWORD 用户：凭据自动保存，token 过期全自动重新登录
+- PASSWORD_OTP 用户：token 过期需重新发送验证码
+- exit code 2 表示认证问题，需重新登录
 - 时区格式必须为 `GMT±HH:MM`
 - 所有 Shell 调用必须加 `required_permissions: ["full_network"]`
